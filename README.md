@@ -35,10 +35,12 @@ Madagascar habitat prediction/
 │           ├── roads_review.xlsx                                  — output of export_roads_to_excel.py
 │           ├── road_growth_hotspots.gpkg                          — QGIS layer: road growth by cell/period, for visual QA
 │           ├── population_by_grid_year.parquet / .xlsx             — grid_id, year, source_year, population_sum (2000/2005/2010/2015/2020/2024) ✅ verified
-│           └── agriculture_by_grid_year.parquet / .xlsx             — grid_id, year, source_year, source_dataset, cropland_pct (2000/2005/2010/2015/2020/2024) ✅ verified
+│           ├── agriculture_by_grid_year.parquet / .xlsx             — grid_id, year, source_year, source_dataset, cropland_pct (2000/2005/2010/2015/2020/2024) ✅ verified
+│           └── nightlights_by_grid_year.parquet / .xlsx             — grid_id, year, source_type, mean_radiance (2000/2005/2010/2015/2020/2024) ✅ verified
 ├── data/raw/worldpop/          — cached WorldPop global rasters (local download, one per year, ~1GB each)
 ├── data/raw/agriculture/glad/       — cached GLAD global cropland tiles (1 file per epoch, SE quadrant only)
 ├── data/raw/agriculture/worldcover/ — cached WorldCover 3°×3° tiles + mosaic.tif, one subfolder per year (2020, 2021)
+├── data/raw/nightlights/        — cached harmonized night-lights zips + extracted tifs, one subfolder per panel year
 ├── qgis/                      — QGIS project files, visual QA only
 ├── packages/, venv/           — environment
 └── madagascar_habitat.qgz     — QGIS project (visualization/inspection, not processing)
@@ -64,6 +66,8 @@ Madagascar habitat prediction/
 | `export_population_to_excel.py` | Exports `population_by_grid_year` to Excel, mirroring the roads export (Phase 9, current) |
 | `GLAD_agriculture.py` | Downloads GLAD cropland epochs + ESA WorldCover tiles, computes % cropland per cell → `agriculture_by_grid_year.parquet` (Phase 10, **complete**) |
 | `agriculture_to_excel.py` | Exports `agriculture_by_grid_year` to Excel, mirroring the roads/population exports, incl. the GLAD cumulative-check verdict (Phase 10, current) |
+| `srunet_nightlights.py` | Downloads the harmonized DMSP/VIIRS night-lights dataset, computes mean radiance per cell → `nightlights_by_grid_year.parquet` (Phase 11, **complete**) |
+| `export_nightlights_to_excel.py` | Exports `nightlights_by_grid_year` to Excel, mirroring the roads/population/agriculture exports (Phase 11, current) |
 | `join_tables.py` | Confirmed: an early, incomplete pass at the Phase 13 master merge — currently only joins forest + fragmentation, predates roads/population/agriculture. Do not treat as the final Phase 13 merge. |
 
 ---
@@ -182,8 +186,27 @@ Every row carries `source_year` and `source_dataset` so the substitution is trac
 
 Output: `agriculture_by_grid_year.parquet` (columns: `grid_id`, `year`, `source_year`, `source_dataset`, `cropland_pct`), exported via `export_agriculture_to_excel.py` with `national_summary` / `by_cell` / `notes` sheets (notes sheet includes the cumulative-check verdict computed directly from the data).
 
-### Phase 11 — Night Lights
-DMSP-OLS (pre-2013) + VIIRS DNB (2012–present). These two sensors are not directly comparable — intercalibration is required to form one continuous series across the ~2012–2013 splice point. This is a well-documented remote-sensing problem with established calibration approaches in the literature; worth a literature check before implementing rather than deriving calibration coefficients from scratch.
+### Phase 11 — Night Lights ✅ Complete
+**Resource:** replaced the originally-planned raw DMSP-OLS (pre-2013) + VIIRS DNB (2012–present) with manual intercalibration, per the literature-check recommendation in the original note. Used instead: Chen et al., ["A global annual simulated VIIRS nighttime light dataset from 1992 to 2023"](https://www.nature.com/articles/s41597-024-04228-6) (updated through 2024), *Scientific Data* (2024) — a single harmonized product covering 1992–2024 in one consistent unit, using a super-resolution model to reconstruct VIIRS-equivalent radiance for the pre-2012 DMSP years. **Every panel year has an exact match** (2000/2005/2010/2015/2020/2024) — no nearest-year substitution needed anywhere, unlike Phase 9/10. `source_type` distinguishes `simulated` (2000/2005/2010, DMSP-reconstructed) from `observed` (2015/2020/2024, real VIIRS).
+
+**Bug resolved:** the same 16 grid cells returned no data in every year regardless of dataset. Diagnosed as rasterstats' default `all_touched=False` only counting a pixel if its *center* falls inside the polygon — for small coastal-sliver cells at this raster's ~500m resolution, that can yield zero qualifying pixels even though the polygon genuinely overlaps real data. Fixed with `all_touched=True`; confirmed via a diagnostic showing 0 cells still missing afterward, ruling out a genuine data gap.
+
+**Bug resolved:** small negative `mean_radiance` values were initially (wrongly) treated as bad data and discarded to `NaN`. VIIRS-derived radiance has sensor/model noise centered near zero in genuinely dark, unlit areas — standard practice is to clip negative values to 0, not discard the cell. This was silently NaN'ing Madagascar's darkest rural cells (exactly what a low-electrification country should look like) until corrected.
+
+**Result — national mean radiance (n = 7,036 cells in every year):**
+
+| Panel year | Mean radiance | Source type | % change vs. prior |
+|---|---:|---|---:|
+| 2000 | 0.001793 | simulated | — |
+| 2005 | 0.001708 | simulated | −4.8% |
+| 2010 | 0.002380 | simulated | +39.4% |
+| 2015 | 0.005159 | observed | +116.7% |
+| 2020 | 0.006651 | observed | +28.9% |
+| 2024 | 0.011877 | observed | +78.6% |
+
+**Open question, not yet resolved:** the three simulated years are an order of magnitude smaller and noisier in direction (a slight *dip* 2000→2005, then a rise) than the clean, larger jumps in the observed years. Could be genuine (limited, non-monotonic electrification before ~2010) or could reflect the SRUNet reconstruction having less dynamic range and more noise than real VIIRS. Worth a sensitivity check — this same dataset has both a simulated and a real value for 2012, so comparing those directly would help isolate model artifact from real signal — before treating the 2000→2005 dip as a finding rather than a limitation.
+
+Output: `nightlights_by_grid_year.parquet` (columns: `grid_id`, `year`, `source_type`, `mean_radiance`), exported via `export_nightlights_to_excel.py` with `national_summary` / `by_cell` / `notes` sheets, same convention as Phases 8–10.
 
 ### Phase 12 — Urbanisation
 GHSL built-up layer. Plan: cross-check against the night-lights series once both exist, since built-up area and night-light intensity should broadly track each other — a large discrepancy would be a useful QA signal for either dataset.
@@ -222,12 +245,15 @@ Combine Phase 20's habitat forecast with Phase 21's scenarios to project impact 
 - **GLAD Global Cropland Extent** is not annual — only five epochs exist (2003/2007/2011/2015/2019), each labeled by its end year; Phase 10's panel years use the nearest epoch with up to ~3yr of label error (see `source_year`). Confirmed (empirically, not just from docs) to be independent per-epoch snapshots, not cumulative — so it does support measuring real cropland loss, unlike a cumulative product would.
 - **ESA WorldCover** only has two real years, 2020 and 2021 — nothing at 2024 (same shape as Phase 9's population gap), and its 2015→2020 splice against GLAD likely contains a methodology-driven level-shift, not a pure trend (see Phase 10 known limitation).
 - **GLAD pixel value 0** means "not cropland" OR "no data" — undistinguished in the high-res product, so true data gaps can't be separated from genuine non-cropland within the GLAD-sourced years.
+- **Night lights simulated-vs-observed dynamic range** — the pre-2012 "simulated" years (2000/2005/2010) are an order of magnitude smaller and noisier in direction (a slight dip 2000→2005) than the observed years (2015/2020/2024), which show clean, larger growth; not yet confirmed whether the dip is real or a reconstruction-model artifact (see Phase 11 open question).
+- **rasterstats `all_touched` default** caused a real bug in Phase 11 (small coastal-sliver cells silently returned no data) — worth checking whether Phases 6/7/9/10 have any equivalent tiny-cell blind spot, even though none showed missing cells in their own QA checks.
 
 ---
 
 ## Suggested Immediate Next Steps
 1. Move the scripts listed above into a proper `scripts/` folder with a consistent import/path convention (currently run from the project root by filename).
-2. Delete the superseded `roads_to_excel.py`; `join_tables.py` is confirmed to be an early, incomplete Phase 13 draft — rewrite it once agriculture is folded in rather than extending it piecemeal.
+2. Delete the superseded `roads_to_excel.py`; `join_tables.py` is confirmed to be an early, incomplete Phase 13 draft — rewrite it once agriculture/nightlights are folded in rather than extending it piecemeal.
 3. Decide and document the Phase 13 join design for roads (static 2024 vs. year-conditional) before finalizing the master merge, so it's a deliberate choice rather than an implementation detail discovered later.
 4. Consider a same-source sensitivity check for the Phase 10 2015→2020 splice (GLAD 2019 vs. WorldCover 2020, both real adjacent years) to quantify how much of the +87% jump is methodology vs. real change, before it feeds Phase 14–17.
-5. Begin Phase 11 (night lights, DMSP↔VIIRS intercalibration) or Phase 12 (urbanisation) — the two remaining data-acquisition phases before the Phase 13 master merge.
+5. Consider the equivalent sensitivity check for Phase 11 (simulated vs. real VIIRS, both available for 2012) to resolve the open question on the flat pre-2010 trend.
+6. Begin Phase 12 (urbanisation, GHSL) — the last remaining data-acquisition phase before the Phase 13 master merge.
